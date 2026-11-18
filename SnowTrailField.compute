@@ -1,0 +1,181 @@
+#pragma kernel CSMain
+
+StructuredBuffer<float4> _Points;
+int    _PointCount;
+float4 _AreaMin;
+float  _AreaSize;
+int    _Resolution;
+float  _HalfWidth;
+float  _ProfilePow;
+float  _NoiseAmount;
+float  _NoiseScale;
+float  _NoiseTiling;
+float  _UseNoiseTex;
+float  _BermHeight;
+float  _BermWidth;
+float  _BermEndTrim;
+float  _EdgeJitter;
+float  _GrainAmount;
+float  _GrainScale;
+RWTexture2D<float> _Result;
+RWTexture2D<float4> _ResultColor;
+
+Texture2D<float4> _NoiseTex;
+SamplerState sampler_NoiseTex;
+
+// 2D → 1D 哈希：同一坐标永远得到同一个随机值
+float Hash2D(float2 p)
+{
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+
+// 值噪声：四角哈希 + 双线性插值
+float ValueNoise2D(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float a = Hash2D(i);
+    float b = Hash2D(i + float2(1.0, 0.0));
+    float c = Hash2D(i + float2(0.0, 1.0));
+    float d = Hash2D(i + float2(1.0, 1.0));
+
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+// 噪声采样：优先用贴图，没有就程序化生成
+float SampleNoise(float2 worldPos)
+{
+    if (_UseNoiseTex > 0.5)
+    {
+        float2 fieldUV = worldPos / max(_NoiseTiling, 0.001);
+        return _NoiseTex.SampleLevel(sampler_NoiseTex, fieldUV, 0).r;
+    }
+
+    float n1 = ValueNoise2D(worldPos * _NoiseScale);
+    float n2 = ValueNoise2D(worldPos * _NoiseScale * 2.7 + 13.1);
+    return n1 * 0.65 + n2 * 0.35;
+}
+
+// 点到线段的最短距离（路径由一串线段组成）
+float DistanceToSegment(float2 p, float2 a, float2 b)
+{
+    float2 segmentVec = b - a;
+    float lengthSq = dot(segmentVec, segmentVec);
+
+    if (lengthSq < 1e-8)
+        return length(p - a);
+
+    float t = saturate(dot(p - a, segmentVec) / lengthSq);
+    return length(p - (a + segmentVec * t));
+}
+
+// 横截面剖面：中心凹陷 + 外侧隆起，返回带符号的压实量
+float SignedCrossSection(float distanceToPath, float remainingLife, float2 worldPos, float endFade, float depthScale)
+{
+    float edgeNoise = SampleNoise(worldPos * 0.65 + 31.7);
+    float edgeJitter = (edgeNoise - 0.5) * 2.0 * _EdgeJitter;
+    float halfWidth = max(0.001, _HalfWidth * (1.0 + edgeJitter));
+
+    float t = distanceToPath / halfWidth;
+    float v;
+
+    if (t <= 1.0)
+    {
+        v = pow(1.0 - t, max(0.1, _ProfilePow));
+    }
+    else
+    {
+        float u = (t - 1.0) / max(0.01, _BermWidth);
+        if (u >= 1.0)
+            return 0.0;
+
+        v = -_BermHeight * sin(3.14159265 * u) * endFade;
+    }
+
+    if (_NoiseAmount > 0.0001)
+    {
+        float n = SampleNoise(worldPos);
+        v *= (1.0 - _NoiseAmount + 2.0 * _NoiseAmount * n);
+    }
+
+    if (_GrainAmount > 0.0001)
+    {
+        float g = Hash2D(floor(worldPos * max(_GrainScale, 0.001)));
+        v *= (1.0 - _GrainAmount + 2.0 * _GrainAmount * g);
+    }
+
+    v *= depthScale;
+
+    return v * remainingLife;
+}
+
+[numthreads(8, 8, 1)]
+// 每个线程算一个像素：找最近的路径段 → 套剖面 → 取最大凹陷/最小隆起
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint resPixels = (uint)_Resolution;
+
+    if (id.x >= resPixels || id.y >= resPixels)
+        return;
+
+    float2 fieldUV = (id.xy + 0.5) / (float)resPixels;
+    float2 worldPos = _AreaMin.xy + fieldUV * _AreaSize;
+
+    float depression = 0.0;
+    float bermDepth = 0.0;
+
+    if (_PointCount > 0)
+    {
+        if (_PointCount == 1)
+        {
+            float4 p0 = _Points[0];
+            float v = SignedCrossSection(length(worldPos - p0.xy), 1.0 - p0.z, worldPos, 0.0, max(0.0, p0.w));
+            depression = max(depression, v);
+            bermDepth = min(bermDepth, v);
+        }
+        else
+        {
+            float segmentCount = max(1.0, (float)(_PointCount - 1));
+            float endTrim = clamp(_BermEndTrim, 0.0, 0.45);
+
+            for (int i = 0; i < _PointCount - 1; i++)
+            {
+                float4 p0 = _Points[i];
+                float4 p1 = _Points[i + 1];
+
+                float2 pointA = p0.xy;
+                float2 pointB = p1.xy;
+                float2 segmentVec = pointB - pointA;
+                float lengthSq = max(dot(segmentVec, segmentVec), 1e-8);
+
+                float rawT = dot(worldPos - pointA, segmentVec) / lengthSq;
+
+                float progress = (i + saturate(rawT)) / segmentCount;
+
+                float endFade = smoothstep(0.0, endTrim, progress) *
+                                (1.0 - smoothstep(1.0 - endTrim, 1.0, progress));
+                endFade = saturate(endFade);
+
+                float distanceToPath = length(worldPos - (pointA + segmentVec * saturate(rawT)));
+                float remainingLife = 1.0 - max(p0.z, p1.z);
+
+                float depthScale = lerp(max(0.0, p0.w), max(0.0, p1.w), saturate(rawT));
+
+                float v = SignedCrossSection(distanceToPath, remainingLife, worldPos, endFade, depthScale);
+                depression = max(depression, v);
+                bermDepth = min(bermDepth, v);
+            }
+        }
+    }
+
+    float signedAmount = depression + bermDepth;
+
+    _Result[id.xy] = signedAmount;
+
+    float visualization = saturate(signedAmount * 0.5 + 0.5);
+    _ResultColor[id.xy] = float4(visualization, visualization, visualization, 1.0);
+}
